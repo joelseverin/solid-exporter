@@ -170,7 +170,7 @@ else:
                 to_up=self.axis_up
             ).to_4x4()
 
-            json_object = solidjson.export_solidjson(scene, settings)
+            json_object = solidjson.export_solidjson(settings)
             with open(self.filepath, 'w') as fout:
                 # Figure out indentation
                 if self.pretty_print:

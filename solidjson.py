@@ -1186,8 +1186,249 @@ def insert_root_nodes(gltf_data, root_matrix):
         # Replace scene node lists to just point to the new root nodes
         scene['nodes'] = [node_name]
 
+def export_mesh(mesh, skinned_meshes):
+    data = {
+        'name': mesh.name
+    }
+    
+    is_skinned = mesh.name in skinned_meshes
 
-def export_solidjson(scene_delta, settings={}):
+    mesh.calc_normals_split()
+    mesh.calc_tessface()
+    
+    if len(mesh.vertex_colors) > 0:
+        print("Warning: mesh", mesh.name, "contains vertex colors, which are ignored.")
+    
+    has_uv_set = True
+    if len(mesh.uv_layers) < 1:
+        has_uv_set = False
+        print("Warning: mesh", mesh.name, "is not UV unwrapped, using zeroes")
+    
+    num_loops = len(mesh.loops)
+    vertex_size = (3 + 3 + 2) * 4 # position, normal, chosen UV set; 4 bytes per float
+
+    buf = Buffer(mesh.name)
+    skin_buf = Buffer('{}_skin'.format(mesh.name))
+
+    vert_list = { Vertex(mesh, loop) : 0 for loop in mesh.loops}.keys()
+    num_verts = len(vert_list)
+    va = buf.add_view(vertex_size * num_verts, Buffer.ARRAY_BUFFER)
+
+    #Interleave
+    if True: # settings['meshes_interleave_vertex_data'] == True:
+        vdata = buf.add_accessor(va, 0, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3)
+        ndata = buf.add_accessor(va, 12, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3)
+        tdata = buf.add_accessor(va, 24, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC2)
+    else:
+        vdata = buf.add_accessor(va, 0, 12, Buffer.FLOAT, num_verts, Buffer.VEC3)
+        ndata = buf.add_accessor(va, num_verts*12, 12, Buffer.FLOAT, num_verts, Buffer.VEC3)
+        tdata = buf.add_accessor(va, num_verts*24, 8, Buffer.FLOAT, num_verts, Buffer.VEC2)
+
+    skin_vertex_size = (4 + 4) * 4
+    skin_va = skin_buf.add_view(skin_vertex_size * num_verts, Buffer.ARRAY_BUFFER)
+    jdata = skin_buf.add_accessor(skin_va, 0, skin_vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC4)
+    wdata = skin_buf.add_accessor(skin_va, 16, skin_vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC4)
+
+    chosen_uv_set = mesh.uv_layers.find('Baked')
+    if chosen_uv_set < 0:
+        chosen_uv_set = 0 # Remember to read has_uv_set too!
+    
+    # Copy vertex data
+    for i, vtx in enumerate(vert_list):
+        vtx.index = i
+        co = vtx.co
+        normal = vtx.normal
+
+        for j in range(3):
+            vdata[(i * 3) + j] = co[j]
+            ndata[(i * 3) + j] = normal[j]
+
+        if has_uv_set:
+            uv = vtx.uvs[chosen_uv_set]
+            tdata[i*2 + 0] = uv.x
+            tdata[i*2 + 1] = uv.y
+        else:
+            tdata[i*2 + 0] = 0
+            tdata[i*2 + 1] = 0
+
+    if is_skinned:
+        for i, vtx in enumerate(vert_list):
+            joints = vtx.joint_indexes
+            weights = vtx.weights
+
+            for j in range(4):
+                jdata[(i * 4) + j] = joints[j]
+                wdata[(i * 4) + j] = weights[j]
+
+    # Note that mesh.materials may contain multiple materials in blender. We use the first for everything.
+    
+    # Map loop indices to vertices for index data extraction
+    vert_dict = {i : v for v in vert_list for i in v.loop_indices}
+    
+    prim = [] # collect primitive vertices by triangulation
+    for poly in mesh.polygons:
+        # Find the (vertex) index associated with each loop in the polygon.
+        indices = [vert_dict[i].index for i in poly.loop_indices]
+
+        if len(indices) == 3:
+            # No triangulation necessary
+            prim += indices
+        elif len(indices) > 3:
+            # Triangulation necessary
+            for i in range(len(indices) - 2):
+                prim += (indices[-1], indices[i], indices[i + 1])
+        else:
+            # Bad polygon
+            raise RuntimeError(
+                "Invalid polygon with {} vertices.".format(len(indices))
+            )
+
+    itype = Buffer.UNSIGNED_INT
+    istride = 4
+
+    ib = buf.add_view(istride * len(prim), Buffer.ELEMENT_ARRAY_BUFFER)
+    idata = buf.add_accessor(ib, 0, istride, itype, len(prim),
+                             Buffer.SCALAR)
+
+    for i, v in enumerate(prim):
+        idata[i] = v
+
+    data['buffers'] = {
+        'positions': vdata.name,
+        'normals': ndata.name,
+        'texcoords': tdata.name,
+        'indices': idata.name
+    }
+
+    if is_skinned:
+        data['buffers']['skinning'] = {
+            'joints': jdata.name,
+            'weights': wdata.name
+        }
+
+    g_buffers.append(buf)
+    if is_skinned:
+        g_buffers.append(skin_buf)
+    return data
+
+def export_solidjson(settings={}):
+    global g_buffers
+    g_buffers = []
+
+    # todo not use explicit context
+    context = bpy.context
+    
+    actions = list(bpy.data.actions)
+    cameras = list(bpy.data.cameras)
+    lamps = list(bpy.data.lamps)
+    images = list(bpy.data.images)
+    materials = list(bpy.data.materials)
+    meshes = list(bpy.data.meshes)
+    objects = list(bpy.data.objects)
+    scenes = list(bpy.data.scenes)
+    textures = list(bpy.data.textures)
+    
+    # Fill in any missing settings with defaults
+    for key, value in default_settings.items():
+        settings.setdefault(key, value)
+
+    skinned_meshes = {}
+    
+    # Collect meshes and apply modifiers
+    mesh_list = []
+    mod_meshes = {}
+    scene = context.scene
+    mod_obs = [ob for ob in objects if ob.is_modified(scene, 'PREVIEW')]
+    for mesh in meshes:
+        mod_users = [ob for ob in mod_obs if ob.data == mesh]
+
+        # Only convert meshes with modifiers, otherwise each non-modifier
+        # user ends up with a copy of the mesh and we lose instancing
+        mod_meshes.update({ob.name: ob.to_mesh(scene, True, 'PREVIEW') for ob in mod_users})
+
+        # Add unmodified meshes directly to the mesh list
+        if len(mod_users) < mesh.users:
+            mesh_list.append(mesh)
+    mesh_list.extend(mod_meshes.values())
+
+    def found_image(image):
+        """todo"""
+    
+    def found_material(material):
+        """todo"""
+    
+    used_meshes = {}
+    def found_mesh(mesh):
+        used_meshes[mesh.name] = export_mesh(mesh, skinned_meshes)
+    
+    # Filter nodes based on our criteria
+    # Below, we also report what we find, lazily instancing the other used_* vars
+    should_include_node = lambda node: any(node.is_visible(scene) and (node.type == 'MESH' or node.type == 'EMPTY') for scene in scenes)
+    def generate_used_node(node):
+        used_node = {
+            #'name': node.name,
+            'transform': togl(node.matrix_world)
+        }
+        
+        children = list(node.children)
+        if node.type == 'EMPTY' and node.dupli_group is not None:
+            children += node.dupli_group.objects
+        used_node['children'] = {child.name: generate_used_node(child) for child in children if should_include_node(child)}
+        
+        if node.type == 'MESH':
+            mesh = mod_meshes.get(node.name, node.data)
+            
+            armature = node.find_armature()
+            if armature:
+                skinned_meshes[mesh.name] = node
+                # found_armature(armature.data.name)
+            
+            found_mesh(mesh)
+            
+            used_node['mesh'] = mesh.name
+        
+        num_materials = len(node.material_slots)
+        if num_materials == 0:
+            print("Warning: no material for node ", node.name)
+        else:
+            if num_materials > 1:
+                print("Warning: too many materials for node", node.name, ", using first:", material.name)
+            material = node.material_slots[0]
+            found_material(material)
+            used_node['material'] = material.name
+            
+        return used_node
+    used_nodes = {node.name: generate_used_node(node) for node in objects if node.parent is None and should_include_node(node)}
+    
+    # Find lights
+    
+    # Find skybox and found_image() it
+    
+    solid_root = {
+        #'materials': used_materials,
+        #'lights': used_lights,
+        'meshes': used_meshes,
+        'nodes': used_nodes,
+        'physics': 'todo',
+        'skins': 'todo'
+    }
+    
+    # Retroactively add skins attribute to nodes
+    #for mesh_name, obj in skinned_meshes.items():
+    #    gltf['nodes']['node_' + obj.name]['skin'] = 'skin_{}'.format(mesh_name)
+
+    #gltf.update(export_buffers(settings))
+    g_buffers = []
+
+    # gltf = {key: value for key, value in gltf.items() if value}
+
+    # Remove any temporary meshes from applying modifiers
+    for mesh in mod_meshes.values():
+        bpy.data.meshes.remove(mesh)
+
+    return solid_root
+  
+def old_export(scene_delta, settings={}):
     global g_buffers
     global g_glExtensionsUsed
 
