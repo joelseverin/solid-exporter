@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "glTF format",
-    "author": "Daniel Stokes",
+    "name": "Solid JSON exporter",
+    "author": "Joel Severin",
     "version": (0, 1, 0),
     "blender": (2, 76, 0),
     "location": "File > Import-Export",
-    "description": "Export glTF",
+    "description": "Export Solid JSON",
     "warning": "",
     "wiki_url": ""
                 "",
@@ -16,17 +16,17 @@ bl_info = {
 if '.' in __name__:
     if 'loaded' in locals():
         import imp
-        imp.reload(blendergltf)
-        from .blendergltf import *
+        imp.reload(solidjson)
+        from .solidjson import *
     else:
         loaded = True
-        from .blendergltf import *
+        from .solidjson import *
 
 # Treat as addon
 else:
     if "bpy" in locals():
         import importlib
-        importlib.reload(blendergltf)
+        importlib.reload(solidjson)
 
 
     import json
@@ -40,7 +40,7 @@ else:
         axis_conversion,
     )
 
-    from . import blendergltf
+    from . import solidjson
 
 
     GLTFOrientationHelper = orientation_helper_factory(
@@ -66,21 +66,21 @@ else:
     )
 
 
-    class ExportGLTF(bpy.types.Operator, ExportHelper, GLTFOrientationHelper):
-        """Save a Khronos glTF File"""
+    class ExportSJSON(bpy.types.Operator, ExportHelper, GLTFOrientationHelper):
+        """Save a Solid JSON File"""
 
-        bl_idname = "export_scene.gltf"
-        bl_label = 'Export glTF'
+        bl_idname = "export_scene.sjson"
+        bl_label = 'Export Solid JSON'
 
-        filename_ext = ".gltf"
+        filename_ext = ".sjson"
         filter_glob = StringProperty(
-                default="*.gltf",
+                default="*.sjson",
                 options={'HIDDEN'},
                 )
 
         check_extension = True
 
-        #blendergltf settings
+        # settings
         buffers_embed_data = BoolProperty(name='Embed Buffer Data', default=False)
         buffers_combine_data = BoolProperty(name='Combine Buffer Data', default=True)
         nodes_export_hidden = BoolProperty(name='Export Hidden Objects', default=False)
@@ -162,7 +162,7 @@ else:
             ))
 
             # Set the output directory based on the supplied file path
-            settings['gltf_output_dir'] = os.path.dirname(self.filepath)
+            settings['solidjson_output_dir'] = os.path.dirname(self.filepath)
 
             # Calculate a global transform matrix to apply to a root node
             settings['nodes_global_matrix'] = axis_conversion(
@@ -170,7 +170,7 @@ else:
                 to_up=self.axis_up
             ).to_4x4()
 
-            gltf = blendergltf.export_gltf(scene, settings)
+            json_object = solidjson.export_solidjson(scene, settings)
             with open(self.filepath, 'w') as fout:
                 # Figure out indentation
                 if self.pretty_print:
@@ -179,7 +179,7 @@ else:
                     indent = None
 
                 # Dump the JSON
-                json.dump(gltf, fout, indent=indent, sort_keys=True,
+                json.dump(json_object, fout, indent=indent, sort_keys=True,
                           check_circular=False)
 
                 if self.pretty_print:
@@ -189,7 +189,7 @@ else:
 
 
     def menu_func_export(self, context):
-        self.layout.operator(ExportGLTF.bl_idname, text="glTF (.gltf)")
+        self.layout.operator(ExportSJSON.bl_idname, text="Solid JSON (.sjson)")
 
 
     def register():

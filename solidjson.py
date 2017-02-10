@@ -14,7 +14,7 @@ import zlib
 
 
 default_settings = {
-    'gltf_output_dir': '',
+    'solidjson_output_dir': '',
     'buffers_embed_data': True,
     'buffers_combine_data': False,
     'nodes_export_hidden': False,
@@ -53,12 +53,12 @@ g_glExtensionsUsed = []
 if 'imported' in locals():
     import imp
     import bpy
-    imp.reload(gpu_luts)
-    imp.reload(shader_converter)
+    #imp.reload(gpu_luts)
+    #imp.reload(shader_converter)
 else:
     imported = True
-    from . import gpu_luts
-    from . import shader_converter
+    #from . import gpu_luts
+    #from . import shader_converter
 
 
 class Vertex:
@@ -251,7 +251,7 @@ class Buffer:
             uri = 'data:text/plain;base64,' + base64.b64encode(data).decode('ascii')
         else:
             uri = bpy.path.clean_name(self.name) + '.bin'
-            with open(os.path.join(settings['gltf_output_dir'], uri), 'wb') as fout:
+            with open(os.path.join(settings['solidjson_output_dir'], uri), 'wb') as fout:
                 fout.write(data)
 
         return {
@@ -441,7 +441,7 @@ def export_materials(settings, materials, shaders, programs, techniques):
                 names = [bpy.path.clean_name(name) + '.glsl' for name in (material.name+'VS', material.name+'FS')]
                 data = (shader_data['vertex'], shader_data['fragment'])
                 for name, data in zip(names, data):
-                    filename = os.path.join(settings['gltf_output_dir'], name)
+                    filename = os.path.join(settings['solidjson_output_dir'], name)
                     with open(filename, 'w') as fout:
                         fout.write(data)
                 vs_uri, fs_uri = names
@@ -983,19 +983,19 @@ def export_images(settings, images):
                 # save the file to the output directory
                 uri = '.'.join([image.name, extMap[image.file_format]])
                 temp = image.filepath
-                image.filepath = os.path.join(settings['gltf_output_dir'], uri)
+                image.filepath = os.path.join(settings['solidjson_output_dir'], uri)
                 image.save()
                 image.filepath = temp
             else:
                 # convert to png and save
                 uri = '.'.join([image.name, 'png'])
                 png = image_to_data_uri(image, bytes=True)
-                with open( os.path.join(settings['gltf_output_dir'], uri), 'wb' ) as outfile:
+                with open( os.path.join(settings['solidjson_output_dir'], uri), 'wb' ) as outfile:
                     outfile.write(png)
 
         elif storage_setting == 'COPY':
             try:
-                shutil.copy(bpy.path.abspath(image.filepath), settings['gltf_output_dir'])
+                shutil.copy(bpy.path.abspath(image.filepath), settings['solidjson_output_dir'])
             except shutil.SameFileError:
                 # If the file already exists, no need to copy
                 pass
@@ -1187,7 +1187,7 @@ def insert_root_nodes(gltf_data, root_matrix):
         scene['nodes'] = [node_name]
 
 
-def export_gltf(scene_delta, settings={}):
+def export_solidjson(scene_delta, settings={}):
     global g_buffers
     global g_glExtensionsUsed
 
