@@ -344,45 +344,6 @@ def togl(matrix):
     return [i for col in matrix.col for i in col]
 
 
-def selected_in_subtree(parent_obj):
-    """Return True if object or any of its children
-       is selected in the outline tree, False otherwise.
-
-    """
-    if parent_obj.select:
-        return True
-    if len(parent_obj.children) > 0:
-        return any(selected_in_subtree(child) for child in parent_obj.children)
-    else:
-        return False
-
-
-def export_cameras(cameras):
-    def export_camera(camera):
-        if camera.type == 'ORTHO':
-            return {
-                'orthographic': {
-                    'xmag': camera.ortho_scale,
-                    'ymag': camera.ortho_scale,
-                    'zfar': camera.clip_end,
-                    'znear': camera.clip_start,
-                },
-                'type': 'orthographic',
-            }
-        else:
-            return {
-                'perspective': {
-                    'aspectRatio': camera.angle_x / camera.angle_y,
-                    'yfov': camera.angle_y,
-                    'zfar': camera.clip_end,
-                    'znear': camera.clip_start,
-                },
-                'type': 'perspective',
-            }
-
-    return {'camera_' + camera.name: export_camera(camera) for camera in cameras}
-
-
 def export_materials(settings, materials, shaders, programs, techniques):
     def export_material(material):
         all_textures = [ts for ts in material.texture_slots if ts and ts.texture.type == 'IMAGE']
@@ -540,183 +501,6 @@ def export_materials(settings, materials, shaders, programs, techniques):
 
     return exp_materials
 
-
-def export_meshes(settings, meshes, skinned_meshes):
-    def export_mesh(me):
-        # glTF data
-        gltf_mesh = {
-                'name': me.name,
-                'primitives': [],
-            }
-
-        is_skinned = me.name in skinned_meshes
-
-        me.calc_normals_split()
-        me.calc_tessface()
-
-        num_loops = len(me.loops)
-        num_uv_layers = len(me.uv_layers)
-        num_col_layers = len(me.vertex_colors)
-        vertex_size = (3 + 3 + num_uv_layers * 2 + num_col_layers * 3) * 4
-
-        buf = Buffer(me.name)
-        skin_buf = Buffer('{}_skin'.format(me.name))
-
-        # Vertex data
-
-        vert_list = { Vertex(me, loop) : 0 for loop in me.loops}.keys()
-        num_verts = len(vert_list)
-        va = buf.add_view(vertex_size * num_verts, Buffer.ARRAY_BUFFER)
-
-        #Interleave
-        if settings['meshes_interleave_vertex_data'] == True:
-            vdata = buf.add_accessor(va, 0, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3)
-            ndata = buf.add_accessor(va, 12, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3)
-            tdata = [buf.add_accessor(va, 24 + 8 * i, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC2) for i in range(num_uv_layers)]
-            cdata = [buf.add_accessor(va, 24 + 8*num_uv_layers + 12*i,
-                vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3) for i in range(num_col_layers)]
-        else:
-            vdata = buf.add_accessor(va, 0, 12, Buffer.FLOAT, num_verts, Buffer.VEC3)
-            ndata = buf.add_accessor(va, num_verts*12, 12, Buffer.FLOAT, num_verts, Buffer.VEC3)
-            tdata = [buf.add_accessor(va, num_verts*(24 + 8 * i), 8, Buffer.FLOAT, num_verts, Buffer.VEC2) for i in range(num_uv_layers)]
-            cdata = [buf.add_accessor(va, num_verts*(24 + 8*num_uv_layers + 12*i),
-                12, Buffer.FLOAT, num_verts, Buffer.VEC3) for i in range(num_col_layers)]
-
-        skin_vertex_size = (4 + 4) * 4
-        skin_va = skin_buf.add_view(skin_vertex_size * num_verts, Buffer.ARRAY_BUFFER)
-        jdata = skin_buf.add_accessor(skin_va, 0, skin_vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC4)
-        wdata = skin_buf.add_accessor(skin_va, 16, skin_vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC4)
-
-        # Copy vertex data
-        for i, vtx in enumerate(vert_list):
-            vtx.index = i
-            co = vtx.co
-            normal = vtx.normal
-
-            for j in range(3):
-                vdata[(i * 3) + j] = co[j]
-                ndata[(i * 3) + j] = normal[j]
-
-            for j, uv in enumerate(vtx.uvs):
-                tdata[j][i * 2] = uv.x
-                tdata[j][i * 2 + 1] = uv.y
-
-            for j, col in enumerate(vtx.colors):
-                cdata[j][i * 3] = col[0]
-                cdata[j][i * 3 + 1] = col[1]
-                cdata[j][i * 3 + 2] = col[2]
-
-        if is_skinned:
-            for i, vtx in enumerate(vert_list):
-                joints = vtx.joint_indexes
-                weights = vtx.weights
-
-                for j in range(4):
-                    jdata[(i * 4) + j] = joints[j]
-                    wdata[(i * 4) + j] = weights[j]
-
-        # For each material, make an empty primitive set.
-        # This dictionary maps material names to list of indices that form the
-        # part of the mesh that the material should be applied to.
-        prims = {ma.name if ma else '': [] for ma in me.materials}
-        if not prims:
-            prims = {'': []}
-
-        # Index data
-        # Map loop indices to vertices
-        vert_dict = {i : v for v in vert_list for i in v.loop_indices}
-
-        max_vert_index = 0
-        for poly in me.polygons:
-            # Find the primitive that this polygon ought to belong to (by
-            # material).
-            if len(me.materials) == 0:
-                prim = prims['']
-            else:
-                mat = me.materials[poly.material_index]
-                prim = prims[mat.name if mat else '']
-
-            # Find the (vertex) index associated with each loop in the polygon.
-            indices = [vert_dict[i].index for i in poly.loop_indices]
-
-            # Used to determine whether a mesh must be split.
-            max_vert_index = max(max_vert_index, max(indices))
-
-            if len(indices) == 3:
-                # No triangulation necessary
-                prim += indices
-            elif len(indices) > 3:
-                # Triangulation necessary
-                for i in range(len(indices) - 2):
-                    prim += (indices[-1], indices[i], indices[i + 1])
-            else:
-                # Bad polygon
-                raise RuntimeError(
-                    "Invalid polygon with {} vertices.".format(len(indices))
-                )
-
-        if max_vert_index > 65535:
-            # Use the integer index extension
-            if OES_ELEMENT_INDEX_UINT not in g_glExtensionsUsed:
-                g_glExtensionsUsed.append(OES_ELEMENT_INDEX_UINT)
-
-        for mat, prim in prims.items():
-            # For each primitive set add an index buffer and accessor.
-
-            # If we got this far use integers if we have to, if this is not
-            # desirable we would have bailed out by now.
-            if max_vert_index > 65535:
-                itype = Buffer.UNSIGNED_INT
-                istride = 4
-            else:
-                itype = Buffer.UNSIGNED_SHORT
-                istride = 2
-
-            ib = buf.add_view(istride * len(prim), Buffer.ELEMENT_ARRAY_BUFFER)
-            idata = buf.add_accessor(ib, 0, istride, itype, len(prim),
-                                     Buffer.SCALAR)
-
-            for i, v in enumerate(prim):
-                idata[i] = v
-
-            gltf_prim = {
-                'attributes': {
-                    'POSITION': vdata.name,
-                    'NORMAL': ndata.name,
-                },
-                'indices': idata.name,
-                'mode': 4,
-            }
-
-            # Add the material reference after checking that it is valid
-            if mat:
-                gltf_prim['material'] = 'material_' + mat
-
-            for i, v in enumerate(tdata):
-                gltf_prim['attributes']['TEXCOORD_' + str(i)] = v.name
-            for i, v in enumerate(cdata):
-                gltf_prim['attributes']['COLOR_' + str(i)] = v.name
-
-            if is_skinned:
-                gltf_prim['attributes']['JOINT'] = jdata.name
-                gltf_prim['attributes']['WEIGHT'] = wdata.name
-
-            gltf_mesh['primitives'].append(gltf_prim)
-
-        g_buffers.append(buf)
-        if is_skinned:
-            g_buffers.append(skin_buf)
-        return gltf_mesh
-
-    exported_meshes = {}
-    for me in meshes:
-        if me.users != 0:
-            gltf_mesh = export_mesh(me)
-            if gltf_mesh != None:
-                exported_meshes.update({'mesh_' + me.name: gltf_mesh})
-    return exported_meshes
-
-
 def export_skins(skinned_meshes):
     def export_skin(obj):
         gltf_skin = {
@@ -805,108 +589,6 @@ def export_lights(lamps):
     return gltf
 
 
-def export_nodes(settings, scenes, objects, skinned_meshes, modded_meshes):
-    def export_physics(obj):
-        rb = obj.rigid_body
-        physics =  {
-            'collision_shape': rb.collision_shape.lower(),
-            'mass': rb.mass,
-            'dynamic': rb.type == 'ACTIVE' and rb.enabled,
-            'dimensions': obj.dimensions[:],
-        }
-
-        if rb.collision_shape in ('CONVEX_HULL', 'MESH'):
-            physics['mesh'] = obj.data.name
-
-        return physics
-
-    is_visible  = lambda obj: True if settings['nodes_export_hidden'] else any(obj.is_visible(scene) for scene in scenes)
-    is_selected = lambda obj: selected_in_subtree(obj) if settings['nodes_selected_only'] else True
-
-    def export_node(obj):
-        ob = {
-            'name': obj.name,
-            'children': ['node_' + child.name for child in obj.children if is_visible(child) and is_selected(child)],
-            'matrix': togl(obj.matrix_world),
-        }
-
-        if obj.type == 'MESH':
-            mesh = modded_meshes.get(obj.name, obj.data)
-            ob['meshes'] = ['mesh_' + mesh.name]
-            if obj.find_armature():
-                ob['skeletons'] = ['{}_root'.format(obj.find_armature().data.name)]
-                skinned_meshes[mesh.name] = obj
-        elif obj.type == 'LAMP':
-            if settings['shaders_data_storage'] == 'NONE':
-                if 'extensions' not in ob:
-                    ob['extensions'] = {}
-                ob['extensions']['KHR_materials_common'] = {'light': 'light_' + obj.data.name}
-        elif obj.type == 'CAMERA':
-            ob['camera'] = obj.data.name
-        elif obj.type == 'EMPTY' and obj.dupli_group is not None:
-            # Expand dupli-groups
-            ob['children'] += ['node_' + i.name for i in obj.dupli_group.objects]
-
-        if obj.rigid_body and settings['ext_export_physics']:
-            ob['extensions'] = {
-                'BLENDER_physics': export_physics(obj)
-            }
-
-        return ob
-
-    gltf_nodes = {'node_' + obj.name: export_node(obj) for obj in objects if is_visible(obj) and is_selected(obj)}
-
-    def export_joint(arm_name, bone):
-        gltf_joint = {
-            'name': bone.name,
-            'jointName': '{}_{}'.format(arm_name, bone.name),
-            'children': ['node_{}_{}'.format(arm_name, child.name) for child in bone.children],
-        }
-
-        if bone.parent:
-            gltf_joint['matrix'] = togl(bone.parent.matrix_local.inverted() * bone.matrix_local)
-        else:
-            gltf_joint['matrix'] = togl(bone.matrix_local)
-
-        return gltf_joint
-
-    for obj in [obj for obj in objects if obj.type == 'ARMATURE']:
-        arm = obj.data
-        gltf_nodes.update({"node_{}_{}".format(arm.name, bone.name): export_joint(arm.name, bone) for bone in arm.bones})
-        gltf_nodes['node_{}_root'.format(arm.name)] = {
-            'name': arm.name,
-            'jointName': arm.name,
-            'children': ['node_{}_{}'.format(arm.name, bone.name) for bone in arm.bones if bone.parent is None],
-            'matrix': togl(obj.matrix_world),
-        }
-
-    return gltf_nodes
-
-
-def export_scenes(settings, scenes):
-    is_selected = lambda obj: selected_in_subtree(obj) if settings['nodes_selected_only'] else True
-
-    def export_scene(scene):
-        result = {
-            'extras': {
-                'background_color': scene.world.horizon_color[:],
-                'active_camera': scene.camera.name if scene.camera else '',
-                'frames_per_second': scene.render.fps,
-            },
-            'name': scene.name,
-        }
-
-        if settings['nodes_export_hidden']:
-            result['nodes'] = ['node_' + ob.name for ob in scene.objects if ob.parent is None and is_selected(ob)]
-            result['extras']['hidden_nodes'] = [ob.name for ob in scene.objects if is_selected(ob) and not ob.is_visible(scene)]
-        else:
-            result['nodes'] = ['node_' + ob.name for ob in scene.objects if ob.parent is None and is_selected(ob) and ob.is_visible(scene)]
-
-        return result
-
-    return {'scene_' + scene.name: export_scene(scene) for scene in scenes}
-
-
 def export_buffers(settings):
     gltf = {
         'buffers': {},
@@ -926,35 +608,6 @@ def export_buffers(settings):
 
     return gltf
 
-
-def image_to_data_uri(image, bytes=False):
-    width = image.size[0]
-    height = image.size[1]
-    buf = bytearray([int(p * 255) for p in image.pixels])
-
-    # reverse the vertical line order and add null bytes at the start
-    width_byte_4 = width * 4
-    raw_data = b''.join(b'\x00' + buf[span:span + width_byte_4]
-                        for span in range((height - 1) * width_byte_4, -1, - width_byte_4))
-
-    def png_pack(png_tag, data):
-        chunk_head = png_tag + data
-        return (struct.pack("!I", len(data)) +
-                chunk_head +
-                struct.pack("!I", 0xFFFFFFFF & zlib.crc32(chunk_head)))
-
-    png_bytes = b''.join([
-        b'\x89PNG\r\n\x1a\n',
-        png_pack(b'IHDR', struct.pack("!2I5B", width, height, 8, 6, 0, 0, 0)),
-        png_pack(b'IDAT', zlib.compress(raw_data, 9)),
-        png_pack(b'IEND', b'')])
-
-    if bytes:
-        return png_bytes
-    else:
-        return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
-
-
 def export_images(settings, images):
     def check_image(image):
         errors = []
@@ -972,13 +625,14 @@ def export_images(settings, images):
 
         return True
 
-    extMap = {'BMP': 'bmp', 'JPEG': 'jpg', 'PNG': 'png', 'TARGA': 'tga'}
+    #extMap = {'BMP': 'bmp', 'JPEG': 'jpg', 'PNG': 'png', 'TARGA': 'tga'}
+    extMap = {'JPEG': 'jpg', 'PNG': 'png'}
     def export_image(image):
         uri = ''
 
         storage_setting = settings['images_data_storage']
         image_packed = image.packed_file != None
-        if image_packed and storage_setting in ['COPY','REFERENCE']:
+        if image_packed:
             if image.file_format in extMap:
                 # save the file to the output directory
                 uri = '.'.join([image.name, extMap[image.file_format]])
@@ -987,29 +641,16 @@ def export_images(settings, images):
                 image.save()
                 image.filepath = temp
             else:
-                # convert to png and save
-                uri = '.'.join([image.name, 'png'])
-                png = image_to_data_uri(image, bytes=True)
-                with open( os.path.join(settings['solidjson_output_dir'], uri), 'wb' ) as outfile:
-                    outfile.write(png)
-
-        elif storage_setting == 'COPY':
+                print("Warning: image", image.name, " is not jpg or png, will not be exported")
+        else:
             try:
                 shutil.copy(bpy.path.abspath(image.filepath), settings['solidjson_output_dir'])
             except shutil.SameFileError:
                 # If the file already exists, no need to copy
                 pass
             uri = os.path.basename(image.filepath)
-        elif storage_setting == 'REFERENCE':
-            uri = image.filepath.replace('//', '')
-        elif storage_setting == 'EMBED':
-            uri = image_to_data_uri(image)
-        else:
-            print('Encountered unknown option ({}) for images_data_storage setting'.format(storage_setting));
 
-        return {
-            'uri': uri,
-        }
+        return uri
 
     return {'image_' + image.name: export_image(image) for image in images if check_image(image)}
 
@@ -1055,122 +696,6 @@ def export_textures(textures):
 
     return {'texture_' + texture.name: export_texture(texture) for texture in textures
         if type(texture) == bpy.types.ImageTexture and check_texture(texture)}
-
-
-def _can_object_use_action(obj, action):
-    for fcurve in action.fcurves:
-        path = fcurve.data_path
-        if not path.startswith('pose'):
-            return obj.animation_data is not None
-
-        if obj.type == 'ARMATURE':
-            path = path.split('["')[-1]
-            path = path.split('"]')[0]
-            if path in [bone.name for bone in obj.data.bones]:
-                return True
-
-    return False
-
-
-def export_actions(actions):
-    def export_action(obj, action):
-        params = []
-
-        exported_paths = {}
-        channels = {}
-
-        sce = bpy.context.scene
-        prev_frame = sce.frame_current
-        prev_action = obj.animation_data.action
-
-        frame_start, frame_end = [int(x) for x in action.frame_range]
-        num_frames = frame_end - frame_start
-        obj.animation_data.action = action
-
-        channels[obj.name] = []
-
-        if obj.type == 'ARMATURE':
-            for pbone in obj.pose.bones:
-                channels[pbone.name] = []
-
-        for frame in range(frame_start, frame_end):
-            sce.frame_set(frame)
-
-            channels[obj.name].append(obj.matrix_local)
-
-            if obj.type == 'ARMATURE':
-                for pbone in obj.pose.bones:
-                    if pbone.parent:
-                        mat = pbone.parent.matrix.inverted() * pbone.matrix
-                    else:
-                        mat = pbone.matrix
-                    channels[pbone.name].append(mat)
-
-        gltf_channels = []
-
-        for targetid, chan in channels.items():
-            buf = Buffer('{}_{}'.format(targetid, action.name))
-            lbv = buf.add_view(num_frames * 3 * 4, None)
-            ldata = buf.add_accessor(lbv, 0, 3 * 4, Buffer.FLOAT, num_frames, Buffer.VEC3)
-            rbv = buf.add_view(num_frames * 4 * 4, None)
-            rdata = buf.add_accessor(rbv, 0, 4 * 4, Buffer.FLOAT, num_frames, Buffer.VEC4)
-            sbv = buf.add_view(num_frames * 3 * 4, None)
-            sdata = buf.add_accessor(sbv, 0, 3 * 4, Buffer.FLOAT, num_frames, Buffer.VEC3)
-
-            for i in range(num_frames):
-                mat = chan[i]
-                loc, rot, scale = mat.decompose()
-                # w needs to be last.
-                rot = (rot.x, rot.y, rot.z, rot.w)
-                for j in range(3):
-                    ldata[(i * 3) + j] = loc[j]
-                    sdata[(i * 3) + j] = scale[j]
-                for j in range(4):
-                    rdata[(i * 4) + j] = rot[j]
-
-            g_buffers.append(buf)
-
-            if targetid != obj.name:
-                targetid = '{}_root_{}'.format(obj.data.name, targetid)
-
-            gltf_channels += [
-                {
-                    'id': targetid,
-                    'path': 'translation',
-                    'data': ldata.name,
-                },
-                {
-                    'id': targetid,
-                    'path': 'rotation',
-                    'data': rdata.name,
-                },
-                {
-                    'id': targetid,
-                    'path': 'scale',
-                    'data': sdata.name,
-                }
-            ]
-
-        gltf_action = {
-            'channels': gltf_channels,
-            'frames': num_frames,
-        }
-
-        obj.animation_data.action = prev_action
-        sce.frame_set(prev_frame)
-
-        return gltf_action
-
-    gltf_actions = {}
-    for obj in bpy.data.objects:
-        act_prefix = '{}_root'.format(obj.data.name) if obj.type == 'ARMATURE' else obj.name
-        gltf_actions.update({
-            '{}|{}'.format(act_prefix, action.name): export_action(obj, action)
-            for action in actions
-            if _can_object_use_action(obj, action)
-        })
-
-    return gltf_actions
 
 
 def insert_root_nodes(gltf_data, root_matrix):
@@ -1427,107 +952,3 @@ def export_solidjson(settings={}):
         bpy.data.meshes.remove(mesh)
 
     return solid_root
-  
-def old_export(scene_delta, settings={}):
-    global g_buffers
-    global g_glExtensionsUsed
-
-    # Fill in any missing settings with defaults
-    for key, value in default_settings.items():
-        settings.setdefault(key, value)
-
-    shaders = {}
-    programs = {}
-    techniques = {}
-    mesh_list = []
-    mod_meshes = {}
-    skinned_meshes = {}
-
-    # Clear globals
-    g_buffers = []
-    g_glExtensionsUsed = []
-
-    object_list = list(scene_delta.get('objects', []))
-
-    # Apply modifiers
-    if settings['meshes_apply_modifiers']:
-        scene = bpy.context.scene
-        mod_obs = [ob for ob in object_list if ob.is_modified(scene, 'PREVIEW')]
-        for mesh in scene_delta.get('meshes', []):
-            mod_users = [ob for ob in mod_obs if ob.data == mesh]
-
-            # Only convert meshes with modifiers, otherwise each non-modifier
-            # user ends up with a copy of the mesh and we lose instancing
-            mod_meshes.update({ob.name: ob.to_mesh(scene, True, 'PREVIEW') for ob in mod_users})
-
-            # Add unmodified meshes directly to the mesh list
-            if len(mod_users) < mesh.users:
-                mesh_list.append(mesh)
-        mesh_list.extend(mod_meshes.values())
-    else:
-        mesh_list = scene_delta.get('meshes', [])
-
-    scenes = scene_delta.get('scenes', [])
-    gltf = {
-        'asset': {
-            'version': '1.0',
-            'profile': profile_map[settings['asset_profile']]
-        },
-        'cameras': export_cameras(scene_delta.get('cameras', [])),
-        'extensions': {},
-        'extensionsUsed': [],
-        'extras': {},
-        'images': export_images(settings, scene_delta.get('images', [])),
-        'materials': export_materials(settings, scene_delta.get('materials', []),
-            shaders, programs, techniques),
-        'nodes': export_nodes(settings, scenes, object_list, skinned_meshes, mod_meshes),
-        # Make sure meshes come after nodes to detect which meshes are skinned
-        'meshes': export_meshes(settings, mesh_list, skinned_meshes),
-        'skins': export_skins(skinned_meshes),
-        'programs': programs,
-        'samplers': {'sampler_default':{}},
-        'scene': 'scene_' + bpy.context.scene.name,
-        'scenes': export_scenes(settings, scenes),
-        'shaders': shaders,
-        'techniques': techniques,
-        'textures': export_textures(scene_delta.get('textures', [])),
-
-        # TODO
-        'animations': {},
-    }
-
-    if settings['shaders_data_storage'] == 'NONE':
-        gltf['extensionsUsed'].append('KHR_materials_common')
-        gltf['extensions']['KHR_materials_common'] = {
-            'lights' : export_lights(scene_delta.get('lamps', []))
-        }
-
-    if settings['ext_export_actions']:
-        gltf['extensionsUsed'].append('BLENDER_actions')
-        gltf['extensions']['BLENDER_actions'] = {
-            'actions': export_actions(scene_delta.get('actions', [])),
-        }
-
-    if settings['ext_export_physics']:
-        gltf['extensionsUsed'].append('BLENDER_physics')
-
-    # Retroactively add skins attribute to nodes
-    for mesh_name, obj in skinned_meshes.items():
-        gltf['nodes']['node_' + obj.name]['skin'] = 'skin_{}'.format(mesh_name)
-
-    # Insert root nodes if axis conversion is needed
-    if settings['nodes_global_matrix'] != mathutils.Matrix.Identity(4):
-        insert_root_nodes(gltf, togl(settings['nodes_global_matrix']))
-
-    gltf.update(export_buffers(settings))
-    gltf.update({'glExtensionsUsed': g_glExtensionsUsed})
-    g_buffers = []
-    g_glExtensionsUsed = []
-
-    gltf = {key: value for key, value in gltf.items() if value}
-
-    # Remove any temporary meshes from applying modifiers
-    for mesh in mod_meshes.values():
-        bpy.data.meshes.remove(mesh)
-
-    return gltf
