@@ -2,7 +2,6 @@ import bpy
 import mathutils
 import gpu
 
-
 import json
 import collections
 import base64
@@ -11,7 +10,6 @@ import os
 import shutil
 import struct
 import zlib
-
 
 default_settings = {
     'solidjson_output_dir': '',
@@ -29,38 +27,21 @@ default_settings = {
     'ext_export_actions': False,
 }
 
-
-# Texture formats
-GL_ALPHA = 6406
-GL_RGB = 6407
-GL_RGBA = 6408
-GL_LUMINANCE = 6409
-GL_LUMINANCE_ALPHA = 6410
-
-# sRGB texture formats (not actually part of WebGL 1.0 or glTF 1.0)
-GL_SRGB = 0x8C40
-GL_SRGB_ALPHA = 0x8C42
-
-OES_ELEMENT_INDEX_UINT = 'OES_element_index_uint'
-
-profile_map = {
-    'WEB': {'api': 'WebGL', 'version': '1.0.3'},
-    'DESKTOP': {'api': 'OpenGL', 'version': '3.0'}
-}
-
-g_glExtensionsUsed = []
-
 if 'imported' in locals():
     import imp
     import bpy
-    #imp.reload(gpu_luts)
-    #imp.reload(shader_converter)
 else:
     imported = True
-    #from . import gpu_luts
-    #from . import shader_converter
 
+g_buffer = bytearray()
 
+def append_buffer(buf):
+    global g_buffer
+    start = len(g_buffer)
+    length = len(buf)
+    g_buffer.extend(buf)
+    return [start, length]
+    
 class Vertex:
     __slots__ = (
         "co",
@@ -113,603 +94,8 @@ class Vertex:
             other.loop_indices = indices
         return eq
 
-class Buffer:
-    ARRAY_BUFFER = 34962
-    ELEMENT_ARRAY_BUFFER = 34963
-
-    BYTE = 5120
-    UNSIGNED_BYTE = 5121
-    SHORT = 5122
-    UNSIGNED_SHORT = 5123
-    INT = 5124
-    UNSIGNED_INT = 5125
-
-    FLOAT = 5126
-
-    MAT4 = 'MAT4'
-    VEC4 = 'VEC4'
-    VEC3 = 'VEC3'
-    VEC2 = 'VEC2'
-    SCALAR = 'SCALAR'
-
-    class Accessor:
-        __slots__ = (
-            "name",
-            "buffer",
-            "buffer_view",
-            "byte_offset",
-            "byte_stride",
-            "component_type",
-            "count",
-            "min",
-            "max",
-            "type",
-            "type_size",
-            "_ctype",
-            "_ctype_size",
-            "_buffer_data",
-            )
-        def __init__(self,
-                     name,
-                     buffer,
-                     buffer_view,
-                     byte_offset,
-                     byte_stride,
-                     component_type,
-                     count,
-                     type):
-            self.name = name
-            self.buffer = buffer
-            self.buffer_view = buffer_view
-            self.byte_offset = byte_offset
-            self.byte_stride = byte_stride
-            self.component_type = component_type
-            self.count = count
-            self.min = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-            self.max = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-            self.type = type
-
-            if self.type == Buffer.MAT4:
-                self.type_size = 16
-            elif self.type == Buffer.VEC4:
-                self.type_size = 4
-            elif self.type == Buffer.VEC3:
-                self.type_size = 3
-            elif self.type == Buffer.VEC2:
-                self.type_size = 2
-            else:
-                self.type_size = 1
-
-            if component_type == Buffer.BYTE:
-                self._ctype = '<b'
-            elif component_type == Buffer.UNSIGNED_BYTE:
-                self._ctype = '<B'
-            elif component_type == Buffer.SHORT:
-                self._ctype = '<h'
-            elif component_type == Buffer.UNSIGNED_SHORT:
-                self._ctype = '<H'
-            elif component_type == Buffer.INT:
-                self._ctype = '<i'
-            elif component_type == Buffer.UNSIGNED_INT:
-                self._ctype = '<I'
-            elif component_type == Buffer.FLOAT:
-                self._ctype = '<f'
-            else:
-                raise ValueError("Bad component type")
-
-            self._ctype_size = struct.calcsize(self._ctype)
-            self._buffer_data = self.buffer._get_buffer_data(self.buffer_view)
-
-        # Inlined for performance, leaving this here as reference
-        # def _get_ptr(self, idx):
-            # addr = ((idx % self.type_size) * self._ctype_size + idx // self.type_size * self.byte_stride) + self.byte_offset
-            # return addr
-
-        def __len__(self):
-            return self.count
-
-        def __getitem__(self, idx):
-            if not isinstance(idx, int):
-                raise TypeError("Expected an integer index")
-
-            ptr = ((idx % self.type_size) * self._ctype_size + idx // self.type_size * self.byte_stride) + self.byte_offset
-
-            return struct.unpack_from(self._ctype, self._buffer_data, ptr)[0]
-
-        def __setitem__(self, idx, value):
-            if not isinstance(idx, int):
-                raise TypeError("Expected an integer index")
-
-            i = idx % self.type_size
-            self.min[i] = value if value < self.min[i] else self.min[i]
-            self.max[i] = value if value > self.max[i] else self.max[i]
-
-            ptr = (i * self._ctype_size + idx // self.type_size * self.byte_stride) + self.byte_offset
-
-            struct.pack_into(self._ctype, self._buffer_data, ptr, value)
-
-    __slots__ = (
-        "name",
-        "type",
-        "bytelength",
-        "buffer_views",
-        "accessors",
-        )
-    def __init__(self, name, uri=None):
-        self.name = 'buffer_{}'.format(name)
-        self.type = 'arraybuffer'
-        self.bytelength = 0
-        self.buffer_views = collections.OrderedDict()
-        self.accessors = {}
-
-    def export_buffer(self, settings):
-        data = bytearray()
-        for bn, bv in self.buffer_views.items():
-            data.extend(bv['data'])
-
-        if settings['buffers_embed_data']:
-            uri = 'data:text/plain;base64,' + base64.b64encode(data).decode('ascii')
-        else:
-            uri = bpy.path.clean_name(self.name) + '.bin'
-            with open(os.path.join(settings['solidjson_output_dir'], uri), 'wb') as fout:
-                fout.write(data)
-
-        return {
-            'byteLength': self.bytelength,
-            'type': self.type,
-            'uri': uri,
-        }
-
-    def add_view(self, bytelength, target):
-        buffer_name = 'bufferView_{}_{}'.format(self.name, len(self.buffer_views))
-        self.buffer_views[buffer_name] = {
-                'data': bytearray(bytelength),
-                'target': target,
-                'bytelength': bytelength,
-                'byteoffset': self.bytelength,
-            }
-        self.bytelength += bytelength
-        return buffer_name
-
-    def export_views(self):
-        gltf = {}
-
-        for k, v in self.buffer_views.items():
-            gltf[k] = {
-                'buffer': self.name,
-                'byteLength': v['bytelength'],
-                'byteOffset': v['byteoffset'],
-            }
-
-            if v['target'] is not None:
-                gltf[k]['target'] = v['target']
-
-        return gltf
-
-    def _get_buffer_data(self, buffer_view):
-        return self.buffer_views[buffer_view]['data']
-
-    def add_accessor(self,
-                     buffer_view,
-                     byte_offset,
-                     byte_stride,
-                     component_type,
-                     count,
-                     type):
-        accessor_name = 'accessor_{}_{}'.format(self.name, len(self.accessors))
-        self.accessors[accessor_name] = self.Accessor(accessor_name, self, buffer_view, byte_offset, byte_stride, component_type, count, type)
-        return self.accessors[accessor_name]
-
-    def export_accessors(self):
-        gltf = {}
-
-        for k, v in self.accessors.items():
-            # Do not export an empty accessor
-            if v.count == 0:
-                continue
-
-            gltf[k] = {
-                'bufferView': v.buffer_view,
-                'byteOffset': v.byte_offset,
-                'byteStride': v.byte_stride,
-                'componentType': v.component_type,
-                'count': v.count,
-                'min': v.min[:v.type_size],
-                'max': v.max[:v.type_size],
-                'type': v.type,
-            }
-
-        return gltf
-
-    def __add__(self, other):
-        # Handle the simple stuff
-        combined = Buffer('combined')
-        combined.bytelength = self.bytelength + other.bytelength
-        combined.accessors = {**self.accessors, **other.accessors}
-
-        # Need to update byte offsets in buffer views
-        combined.buffer_views = self.buffer_views.copy()
-        other_views = other.buffer_views.copy()
-        for key in other_views.keys():
-            other_views[key]['byteoffset'] += self.bytelength
-        combined.buffer_views.update(other_views)
-
-        return combined
-
-
-g_buffers = []
-
-
 def togl(matrix):
     return [i for col in matrix.col for i in col]
-
-
-def export_materials(settings, materials, shaders, programs, techniques):
-    def export_material(material):
-        all_textures = [ts for ts in material.texture_slots if ts and ts.texture.type == 'IMAGE']
-        diffuse_textures = ['texture_' + t.texture.name for t in all_textures if t.use_map_color_diffuse]
-        emission_textures = ['texture_' + t.texture.name for t in all_textures if t.use_map_emit]
-        specular_textures = ['texture_' + t.texture.name for t in all_textures if t.use_map_color_spec]
-        diffuse_color = list((material.diffuse_color * material.diffuse_intensity)[:]) + [material.alpha]
-        emission_color = list((material.diffuse_color * material.emit)[:]) + [material.alpha]
-        specular_color = list((material.specular_color * material.specular_intensity)[:]) + [material.specular_alpha]
-        technique = 'PHONG'
-        if material.use_shadeless:
-            technique = 'CONSTANT'
-        elif material.specular_intensity == 0.0:
-            technique = 'LAMBERT'
-        elif material.specular_shader == 'BLINN':
-            technique = 'BLINN'
-        return {
-                'extensions': {
-                    'KHR_materials_common': {
-                        'technique': technique,
-                        'values': {
-                            'ambient': ([material.ambient]*3) + [1.0],
-                            'diffuse': diffuse_textures[-1] if diffuse_textures else diffuse_color,
-                            'doubleSided': not material.game_settings.use_backface_culling,
-                            'emission': emission_textures[-1] if emission_textures else emission_color,
-                            'specular': specular_textures[-1] if specular_textures else specular_color,
-                            'shininess': material.specular_hardness,
-                            'transparency': material.alpha,
-                            'transparent': material.use_transparency,
-                        }
-                    }
-                },
-                'name': material.name,
-            }
-    exp_materials = {}
-    for material in materials:
-        if settings['shaders_data_storage'] == 'NONE':
-            exp_materials['material_' + material.name] = export_material(material)
-        else:
-            # Handle shaders
-            shader_data = gpu.export_shader(bpy.context.scene, material)
-            if settings['asset_profile'] == 'DESKTOP':
-                shader_converter.to_130(shader_data)
-            else:
-                shader_converter.to_web(shader_data)
-
-            fs_name = 'shader_{}_FS'.format(material.name)
-            vs_name = 'shader_{}_VS'.format(material.name)
-            storage_setting = settings['shaders_data_storage']
-            if storage_setting == 'EMBED':
-                fs_bytes = shader_data['fragment'].encode()
-                fs_uri = 'data:text/plain;base64,' + base64.b64encode(fs_bytes).decode('ascii')
-                vs_bytes = shader_data['vertex'].encode()
-                vs_uri = 'data:text/plain;base64,' + base64.b64encode(vs_bytes).decode('ascii')
-            elif storage_setting == 'EXTERNAL':
-                names = [bpy.path.clean_name(name) + '.glsl' for name in (material.name+'VS', material.name+'FS')]
-                data = (shader_data['vertex'], shader_data['fragment'])
-                for name, data in zip(names, data):
-                    filename = os.path.join(settings['solidjson_output_dir'], name)
-                    with open(filename, 'w') as fout:
-                        fout.write(data)
-                vs_uri, fs_uri = names
-            else:
-                print('Encountered unknown option ({}) for shaders_data_storage setting'.format(storage_setting));
-
-            shaders[fs_name] = {'type': 35632, 'uri': fs_uri}
-            shaders[vs_name] = {'type': 35633, 'uri': vs_uri}
-
-            # Handle programs
-            programs['program_' + material.name] = {
-                'attributes' : [a['varname'] for a in shader_data['attributes']],
-                'fragmentShader' : 'shader_{}_FS'.format(material.name),
-                'vertexShader' : 'shader_{}_VS'.format(material.name),
-            }
-
-            # Handle parameters/values
-            values = {}
-            parameters = {}
-            for attribute in shader_data['attributes']:
-                name = attribute['varname']
-                semantic = gpu_luts.TYPE_TO_SEMANTIC[attribute['type']]
-                _type = gpu_luts.DATATYPE_TO_GLTF_TYPE[attribute['datatype']]
-                parameters[name] = {'semantic': semantic, 'type': _type}
-
-            for uniform in shader_data['uniforms']:
-                valname = gpu_luts.TYPE_TO_NAME.get(uniform['type'], uniform['varname'])
-                rnaname = valname
-                semantic = None
-                node = None
-                value = None
-
-                if uniform['varname'] == 'bl_ModelViewMatrix':
-                    semantic = 'MODELVIEW'
-                elif uniform['varname'] == 'bl_ProjectionMatrix':
-                    semantic = 'PROJECTION'
-                elif uniform['varname'] == 'bl_NormalMatrix':
-                    semantic = 'MODELVIEWINVERSETRANSPOSE'
-                else:
-                    if uniform['type'] in gpu_luts.LAMP_TYPES:
-                        node = uniform['lamp'].name
-                        valname = node + '_' + valname
-                        semantic = gpu_luts.TYPE_TO_SEMANTIC.get(uniform['type'], None)
-                        if not semantic:
-                            lamp_obj = bpy.data.objects[node]
-                            value = getattr(lamp_obj.data, rnaname)
-                    elif uniform['type'] in gpu_luts.MIST_TYPES:
-                        valname = 'mist_' + valname
-                        mist_settings = bpy.context.scene.world.mist_settings
-                        if valname == 'mist_color':
-                            value = bpy.context.scene.world.horizon_color
-                        else:
-                            value = getattr(mist_settings, rnaname)
-
-                        if valname == 'mist_falloff':
-                            value = 0.0 if value == 'QUADRATIC' else 1.0 if 'LINEAR' else 2.0
-                    elif uniform['type'] in gpu_luts.WORLD_TYPES:
-                        world = bpy.context.scene.world
-                        value = getattr(world, rnaname)
-                    elif uniform['type'] in gpu_luts.MATERIAL_TYPES:
-                        value = gpu_luts.DATATYPE_TO_CONVERTER[uniform['datatype']](getattr(material, rnaname))
-                        values[valname] = value
-                    elif uniform['type'] == gpu.GPU_DYNAMIC_SAMPLER_2DIMAGE:
-                        for ts in [ts for ts in material.texture_slots if ts and ts.texture.type == 'IMAGE']:
-                            if ts.texture.image.name == uniform['image'].name:
-                                value = 'texture_' + ts.texture.name
-                                values[uniform['varname']] = value
-                    else:
-                        print('Unconverted uniform:', uniform)
-
-                parameter = {}
-                if semantic:
-                    parameter['semantic'] = semantic
-                    if node:
-                        parameter['node'] = 'node_' + node
-                else:
-                    parameter['value'] = gpu_luts.DATATYPE_TO_CONVERTER[uniform['datatype']](value)
-                if uniform['type'] == gpu.GPU_DYNAMIC_SAMPLER_2DIMAGE:
-                    parameter['type'] = 35678 #SAMPLER_2D
-                else:
-                    parameter['type'] = gpu_luts.DATATYPE_TO_GLTF_TYPE[uniform['datatype']]
-                parameters[valname] = parameter
-                uniform['valname'] = valname
-
-            # Handle techniques
-            tech_name = 'technique_' + material.name
-            techniques[tech_name] = {
-                'parameters' : parameters,
-                'program' : 'program_' + material.name,
-                'attributes' : {a['varname'] : a['varname'] for a in shader_data['attributes']},
-                'uniforms' : {u['varname'] : u['valname'] for u in shader_data['uniforms']},
-            }
-
-            exp_materials['material_' + material.name] = {'technique': tech_name, 'values': values}
-            # exp_materials[material.name] = {}
-
-    return exp_materials
-
-def export_skins(skinned_meshes):
-    def export_skin(obj):
-        gltf_skin = {
-            'bindShapeMatrix': togl(mathutils.Matrix.Identity(4)),
-            'name': obj.name,
-        }
-        arm = obj.find_armature()
-        gltf_skin['jointNames'] = ['node_{}_{}'.format(arm.name, group.name) for group in obj.vertex_groups]
-
-        element_size = 16 * 4
-        num_elements = len(obj.vertex_groups)
-        buf = Buffer('IBM_{}_skin'.format(obj.name))
-        buf_view = buf.add_view(element_size * num_elements, None)
-        idata = buf.add_accessor(buf_view, 0, element_size, Buffer.FLOAT, num_elements, Buffer.MAT4)
-
-        for i in range(num_elements):
-            mat = togl(mathutils.Matrix.Identity(4))
-            for j in range(16):
-                idata[(i * 16) + j] = mat[j]
-
-        gltf_skin['inverseBindMatrices'] = idata.name
-        g_buffers.append(buf)
-
-        return gltf_skin
-
-    return {'skin_' + mesh_name: export_skin(obj) for mesh_name, obj in skinned_meshes.items()}
-
-
-def export_lights(lamps):
-    def export_light(light):
-        def calc_att():
-            kl = 0
-            kq = 0
-
-            if light.falloff_type == 'INVERSE_LINEAR':
-                kl = 1 / light.distance
-            elif light.falloff_type == 'INVERSE_SQUARE':
-                kq = 1 / light.distance
-            elif light.falloff_type == 'LINEAR_QUADRATIC_WEIGHTED':
-                kl = light.linear_attenuation * (1 / light.distance)
-                kq = light.quadratic_attenuation * (1 / (light.distance * light.distance))
-
-            return kl, kq
-
-        if light.type == 'SUN':
-            return {
-                'directional': {
-                    'color': (light.color * light.energy)[:],
-                },
-                'type': 'directional',
-            }
-        elif light.type == 'POINT':
-            kl, kq = calc_att()
-            return {
-                'point': {
-                    'color': (light.color * light.energy)[:],
-
-                    # TODO: grab values from Blender lamps
-                    'constantAttenuation': 1,
-                    'linearAttenuation': kl,
-                    'quadraticAttenuation': kq,
-                },
-                'type': 'point',
-            }
-        elif light.type == 'SPOT':
-            kl, kq = calc_att()
-            return {
-                'spot': {
-                    'color': (light.color * light.energy)[:],
-
-                    # TODO: grab values from Blender lamps
-                    'constantAttenuation': 1.0,
-                    'fallOffAngle': 3.14159265,
-                    'fallOffExponent': 0.0,
-                    'linearAttenuation': kl,
-                    'quadraticAttenuation': kq,
-                },
-                'type': 'spot',
-            }
-        else:
-            print("Unsupported lamp type on {}: {}".format(light.name, light.type))
-            return {'type': 'unsupported'}
-
-    gltf = {'light_' + lamp.name: export_light(lamp) for lamp in lamps}
-
-    return gltf
-
-
-def export_buffers(settings):
-    gltf = {
-        'buffers': {},
-        'bufferViews': {},
-        'accessors': {},
-    }
-
-    if settings['buffers_combine_data']:
-        buffers = [functools.reduce(lambda x, y: x+y, g_buffers)]
-    else:
-        buffers = g_buffers
-
-    for buf in buffers:
-        gltf['buffers'][buf.name] = buf.export_buffer(settings)
-        gltf['bufferViews'].update(buf.export_views())
-        gltf['accessors'].update(buf.export_accessors())
-
-    return gltf
-
-def export_images(settings, images):
-    def check_image(image):
-        errors = []
-        if image.size[0] == 0:
-            errors.append('x dimension is 0')
-        if image.size[1] == 0:
-            errors.append('y dimension is 0')
-        if image.type != 'IMAGE':
-            errors.append('not an image')
-
-        if errors:
-            err_list = '\n\t'.join(errors)
-            print('Unable to export image {} due to the following errors:\n\t{}'.format(image.name, err_list))
-            return False
-
-        return True
-
-    #extMap = {'BMP': 'bmp', 'JPEG': 'jpg', 'PNG': 'png', 'TARGA': 'tga'}
-    extMap = {'JPEG': 'jpg', 'PNG': 'png'}
-    def export_image(image):
-        uri = ''
-
-        storage_setting = settings['images_data_storage']
-        image_packed = image.packed_file != None
-        if image_packed:
-            if image.file_format in extMap:
-                # save the file to the output directory
-                uri = '.'.join([image.name, extMap[image.file_format]])
-                temp = image.filepath
-                image.filepath = os.path.join(settings['solidjson_output_dir'], uri)
-                image.save()
-                image.filepath = temp
-            else:
-                print("Warning: image", image.name, " is not jpg or png, will not be exported")
-        else:
-            try:
-                shutil.copy(bpy.path.abspath(image.filepath), settings['solidjson_output_dir'])
-            except shutil.SameFileError:
-                # If the file already exists, no need to copy
-                pass
-            uri = os.path.basename(image.filepath)
-
-        return uri
-
-    return {'image_' + image.name: export_image(image) for image in images if check_image(image)}
-
-
-def export_textures(textures):
-    def check_texture(texture):
-        errors = []
-        if texture.image == None:
-            errors.append('has no image reference')
-        elif texture.image.channels not in [3,4]:
-            errors.append('points to {}-channel image (must be 3 or 4)'.format(texture.image.channels))
-
-        if errors:
-            err_list = '\n\t'.join(errors)
-            print('Unable to export texture {} due to the following errors:\n\t{}'.format(texture.name, err_list))
-            return False
-
-        return True
-
-    def export_texture(texture):
-        gltf_texture = {
-            'sampler' : 'sampler_default',
-            'source' : 'image_' + texture.image.name,
-        }
-        tformat = None
-        channels = texture.image.channels
-        use_srgb = texture.image.colorspace_settings.name == 'sRGB'
-
-        if channels == 3:
-            if use_srgb:
-                tformat = GL_SRGB
-            else:
-                tformat = GL_RGB
-        elif channels == 4:
-            if use_srgb:
-                tformat = GL_SRGB_ALPHA
-            else:
-                tformat = GL_RGBA
-
-        gltf_texture['format'] = gltf_texture['internalFormat'] = tformat
-
-        return gltf_texture
-
-    return {'texture_' + texture.name: export_texture(texture) for texture in textures
-        if type(texture) == bpy.types.ImageTexture and check_texture(texture)}
-
-
-def insert_root_nodes(gltf_data, root_matrix):
-    for name, scene in gltf_data['scenes'].items():
-        node_name = 'node_{}_root'.format(name)
-        # Generate a new root node for each scene
-        gltf_data['nodes'][node_name] = {
-            'children': scene['nodes'],
-            'matrix': root_matrix,
-            'name': node_name,
-        }
-
-        # Replace scene node lists to just point to the new root nodes
-        scene['nodes'] = [node_name]
 
 def export_mesh(mesh, skinned_meshes):
     data = {
@@ -729,52 +115,46 @@ def export_mesh(mesh, skinned_meshes):
         has_uv_set = False
         print("Warning: mesh", mesh.name, "is not UV unwrapped, using zeroes")
     
-    num_loops = len(mesh.loops)
-    vertex_size = (3 + 3 + 2) * 4 # position, normal, chosen UV set; 4 bytes per float
-
-    buf = Buffer(mesh.name)
-    skin_buf = Buffer('{}_skin'.format(mesh.name))
-
     vert_list = { Vertex(mesh, loop) : 0 for loop in mesh.loops}.keys()
     num_verts = len(vert_list)
-    va = buf.add_view(vertex_size * num_verts, Buffer.ARRAY_BUFFER)
-
-    #Interleave
-    if True: # settings['meshes_interleave_vertex_data'] == True:
-        vdata = buf.add_accessor(va, 0, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3)
-        ndata = buf.add_accessor(va, 12, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC3)
-        tdata = buf.add_accessor(va, 24, vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC2)
-    else:
-        vdata = buf.add_accessor(va, 0, 12, Buffer.FLOAT, num_verts, Buffer.VEC3)
-        ndata = buf.add_accessor(va, num_verts*12, 12, Buffer.FLOAT, num_verts, Buffer.VEC3)
-        tdata = buf.add_accessor(va, num_verts*24, 8, Buffer.FLOAT, num_verts, Buffer.VEC2)
-
+    
+    vertex_size = (3 + 3 + 2) * 4 # position, normal, chosen UV set; 4 bytes per float
     skin_vertex_size = (4 + 4) * 4
-    skin_va = skin_buf.add_view(skin_vertex_size * num_verts, Buffer.ARRAY_BUFFER)
-    jdata = skin_buf.add_accessor(skin_va, 0, skin_vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC4)
-    wdata = skin_buf.add_accessor(skin_va, 16, skin_vertex_size, Buffer.FLOAT, num_verts, Buffer.VEC4)
+    
+    buf = bytearray(num_verts * vertex_size)
+    if is_skinned:
+        skin_buf = bytearray(num_verts * skin_vertex_size)
 
     chosen_uv_set = mesh.uv_layers.find('Baked')
     if chosen_uv_set < 0:
-        chosen_uv_set = 0 # Remember to read has_uv_set too!
+        chosen_uv_set = 0 # Pick first. Remember to read has_uv_set too!
     
     # Copy vertex data
     for i, vtx in enumerate(vert_list):
+        base = i * vertex_size
+        base_position = base
+        base_normal = base + 3*4
+        base_texcoord = base + (3 + 2)*4
+        
+        skin_base = i * skin_vertex_size
+        skin_base_joints = skin_base
+        skin_base_weights = skin_base + 4*4
+        
         vtx.index = i
         co = vtx.co
         normal = vtx.normal
 
         for j in range(3):
-            vdata[(i * 3) + j] = co[j]
-            ndata[(i * 3) + j] = normal[j]
+            struct.pack_into('<f', buf, base_position + j*4, co[j])
+            struct.pack_into('<f', buf, base_normal + j*4, normal[j])
 
         if has_uv_set:
             uv = vtx.uvs[chosen_uv_set]
-            tdata[i*2 + 0] = uv.x
-            tdata[i*2 + 1] = uv.y
+            struct.pack_into('<f', buf, base_texcoord + 0*4, uv.x)
+            struct.pack_into('<f', buf, base_texcoord + 1*4, uv.y)
         else:
-            tdata[i*2 + 0] = 0
-            tdata[i*2 + 1] = 0
+            struct.pack_into('<f', buf, base_texcoord + 0*4, 0)
+            struct.pack_into('<f', buf, base_texcoord + 1*4, 0)
 
     if is_skinned:
         for i, vtx in enumerate(vert_list):
@@ -782,19 +162,23 @@ def export_mesh(mesh, skinned_meshes):
             weights = vtx.weights
 
             for j in range(4):
-                jdata[(i * 4) + j] = joints[j]
-                wdata[(i * 4) + j] = weights[j]
+                struct.pack_into('<f', skin_buf, skin_base_joints + j*4, joints[j])
+                struct.pack_into('<f', skin_buf, skin_base_weights + j*4, weights[j])
 
     # Note that mesh.materials may contain multiple materials in blender. We use the first for everything.
     
     # Map loop indices to vertices for index data extraction
     vert_dict = {i : v for v in vert_list for i in v.loop_indices}
     
-    prim = [] # collect primitive vertices by triangulation
+    # Collect primitive vertices by triangulation
+    prim = []
+    max_vert_index = 0
     for poly in mesh.polygons:
         # Find the (vertex) index associated with each loop in the polygon.
         indices = [vert_dict[i].index for i in poly.loop_indices]
 
+        max_vert_index = max(max_vert_index, max(indices))
+        
         if len(indices) == 3:
             # No triangulation necessary
             prim += indices
@@ -808,37 +192,158 @@ def export_mesh(mesh, skinned_meshes):
                 "Invalid polygon with {} vertices.".format(len(indices))
             )
 
-    itype = Buffer.UNSIGNED_INT
-    istride = 4
-
-    ib = buf.add_view(istride * len(prim), Buffer.ELEMENT_ARRAY_BUFFER)
-    idata = buf.add_accessor(ib, 0, istride, itype, len(prim),
-                             Buffer.SCALAR)
-
+    index_stride = 4
+    index_buf = bytearray(index_stride * len(prim))
+    
     for i, v in enumerate(prim):
-        idata[i] = v
+        # <I is 32-bit unsigned int (we may downgrade this in later stages)
+        struct.pack_into('<I', index_buf, i*index_stride, v)
 
     data['buffers'] = {
-        'positions': vdata.name,
-        'normals': ndata.name,
-        'texcoords': tdata.name,
-        'indices': idata.name
+        'vertices': append_buffer(buf),
+        'indices': append_buffer(index_buf)
     }
 
     if is_skinned:
-        data['buffers']['skinning'] = {
-            'joints': jdata.name,
-            'weights': wdata.name
-        }
+        data['buffers']['skinning'] = append_buffer(skin_buf)
 
-    g_buffers.append(buf)
-    if is_skinned:
-        g_buffers.append(skin_buf)
+    # 65535-1 is optimal, as most WebGL implementations that make use of Direct3D
+    # have problems with handling the 65535, that would otherwise be OpenGL's max.
+    if max_vert_index > 65534:
+        print("Warning: Exported mesh", mesh.name, "has index higher than 65534:", max_vert_index)
+    
+    return data
+
+def export_image(image, settings):
+    def check_image(image):
+        errors = []
+        if image.size[0] == 0:
+            errors.append('x dimension is 0')
+        if image.size[1] == 0:
+            errors.append('y dimension is 0')
+        if image.type != 'IMAGE':
+            errors.append('not an image')
+
+        if errors:
+            err_list = '\n\t'.join(errors)
+            print('Unable to export image {} due to the following errors:\n\t{}'.format(image.name, err_list))
+            return False
+
+        return True
+
+    #extMap = {'BMP': 'bmp', 'JPEG': 'jpg', 'PNG': 'png', 'TARGA': 'tga'}
+    extMap = {'JPEG': 'jpg', 'PNG': 'png'}
+    uri = ''
+
+    if check_image(image):
+        if image.packed_file != None:
+            if image.file_format in extMap:
+                # save the file to the output directory
+                uri = '.'.join([image.name, extMap[image.file_format]])
+                temp = image.filepath
+                image.filepath = os.path.join(settings['solidjson_output_dir'], uri)
+                image.save()
+                image.filepath = temp
+            else:
+                print("Warning: image", image.name, " is not jpg or png, will not be exported")
+        else:
+            try:
+                shutil.copy(bpy.path.abspath(image.filepath), settings['solidjson_output_dir'])
+            except shutil.SameFileError:
+                # If the file already exists, no need to copy
+                pass
+            
+            path = image.filepath
+            
+            # No idea why, but it starts with // at least sometimes, and then the basename
+            # becomes an empty string. Let's just remove the // part and hope for the best.
+            if path.startswith("//"):
+                path = path[2:]
+            
+            uri = os.path.basename(path)
+    return uri # image.name is also available
+
+def make_image_data_uri(value):
+    # R G B A
+    write = [0, 0, 0, 1]
+    if type(value) is float:
+        for k in range(3):
+            write[k] = value
+    else:
+        for j, v in enumerate(value):
+            write[j] = v
+    
+    def png_pack(png_tag, data):
+        chunk_head = png_tag + data
+        return (struct.pack("!I", len(data)) +
+            chunk_head +
+            struct.pack("!I", 0xFFFFFFFF & zlib.crc32(chunk_head)))
+
+    width = 1
+    height = 1
+    raw_data = b'\x00' + bytearray([int(p * 255) for p in write])
+    png_bytes = b''.join([
+        b'\x89PNG\r\n\x1a\n',
+        png_pack(b'IHDR', struct.pack("!2I5B", width, height, 8, 6, 0, 0, 0)),
+        png_pack(b'IDAT', zlib.compress(raw_data, 9)),
+        png_pack(b'IEND', b'')])
+
+    return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+
+def find_solidrendering_group(material):
+    if material.node_tree is None:
+        print("Warning: material", material.name, "has no Cycles node tree, skipping it")
+        return None
+    
+    if 'Group' not in material.node_tree.nodes:
+        print("Warning: material", material.name, "has no (SolidRendering) node named Group, skipping it")
+        return None
+    
+    # Todo: Group is just the name of the node. We should probably iterate and match type instead.
+    group = material.node_tree.nodes['Group']
+    
+    if type(group.interface) is not bpy.types.NodeTreeInterface_SolidRendering:
+        print("Warning: material", material.name, "has Group but is not SolidRendering, skipping it")
+        return None
+    
+    return group
+
+def image_from_solidrendering_group(group, name, settings, default = None):
+    prop = group.inputs[name]
+    links = prop.links
+    if len(links) > 0:
+        node = links[0].from_node
+        if type(node) is bpy.types.ShaderNodeTexImage:
+            # Todo is to make sure the same image is only exported once
+            return export_image(node.image, settings)
+        else:
+            print('Warning: material', material.name, 'has attachment that is not an Image Texture on slot', name)
+            return ''
+    else:
+        # default is so strong that it overrides values set on the node group directly ("default_value" they are called)
+        if default is None:
+            return make_image_data_uri(prop.default_value)
+        else:
+            return make_image_data_uri(default)
+
+def export_material(material, settings):
+    group = find_solidrendering_group(material)
+    if group is None:
+        return None
+    
+    data = {
+        'base_color': image_from_solidrendering_group(group, 'BaseColor', settings),
+        'metalness': image_from_solidrendering_group(group, 'Metalness', settings),
+        'roughness': image_from_solidrendering_group(group, 'Roughness', settings),
+        'reflectivity': image_from_solidrendering_group(group, 'Reflectivity', settings),
+        'normal': image_from_solidrendering_group(group, 'Normal', settings, [0, 0, 1])
+    }
+    
     return data
 
 def export_solidjson(settings={}):
-    global g_buffers
-    g_buffers = []
+    global g_buffer
+    g_buffer = bytearray()
 
     # todo not use explicit context
     context = bpy.context
@@ -878,13 +383,17 @@ def export_solidjson(settings={}):
 
     def found_image(image):
         """todo"""
-    
+    used_materials = {}
     def found_material(material):
-        """todo"""
+        if not material.name in used_materials:
+            exported = export_material(material, settings)
+            if exported is not None:
+                used_materials[material.name] = exported
     
     used_meshes = {}
     def found_mesh(mesh):
-        used_meshes[mesh.name] = export_mesh(mesh, skinned_meshes)
+        if not mesh.name in used_meshes:
+            used_meshes[mesh.name] = export_mesh(mesh, skinned_meshes)
     
     # Filter nodes based on our criteria
     # Below, we also report what we find, lazily instancing the other used_* vars
@@ -914,11 +423,11 @@ def export_solidjson(settings={}):
         
         num_materials = len(node.material_slots)
         if num_materials == 0:
-            print("Warning: no material for node ", node.name)
+            print("Warning: no material for node", node.name)
         else:
+            material = node.material_slots[0].material
             if num_materials > 1:
                 print("Warning: too many materials for node", node.name, ", using first:", material.name)
-            material = node.material_slots[0]
             found_material(material)
             used_node['material'] = material.name
             
@@ -930,7 +439,7 @@ def export_solidjson(settings={}):
     # Find skybox and found_image() it
     
     solid_root = {
-        #'materials': used_materials,
+        'materials': used_materials,
         #'lights': used_lights,
         'meshes': used_meshes,
         'nodes': used_nodes,
@@ -942,13 +451,17 @@ def export_solidjson(settings={}):
     #for mesh_name, obj in skinned_meshes.items():
     #    gltf['nodes']['node_' + obj.name]['skin'] = 'skin_{}'.format(mesh_name)
 
-    #gltf.update(export_buffers(settings))
-    g_buffers = []
+    # Write out the large binary buffer containing all meshes
+    with open(os.path.join(settings['solidjson_output_dir'], 'meshdata.bin'), 'wb') as fout:
+        fout.write(g_buffer)
+    g_buffer = bytearray()
 
     # gltf = {key: value for key, value in gltf.items() if value}
 
     # Remove any temporary meshes from applying modifiers
     for mesh in mod_meshes.values():
         bpy.data.meshes.remove(mesh)
+
+    print("Solid JSON export completed. Review any warnings above.")
 
     return solid_root
