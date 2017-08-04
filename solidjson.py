@@ -336,6 +336,8 @@ def export_material(material, settings):
         'metalness': image_from_solidrendering_group(group, 'Metalness', settings),
         'roughness': image_from_solidrendering_group(group, 'Roughness', settings),
         'reflectivity': image_from_solidrendering_group(group, 'Reflectivity', settings),
+        'emissive': image_from_solidrendering_group(group, 'Emissive', settings),
+        'sky_visibility': image_from_solidrendering_group(group, 'SkyVisibility', settings),
         'normal': image_from_solidrendering_group(group, 'Normal', settings, [0, 0, 1])
     }
     
