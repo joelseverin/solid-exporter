@@ -134,7 +134,7 @@ def export_mesh(mesh, skinned_meshes):
         base = i * vertex_size
         base_position = base
         base_normal = base + 3*4
-        base_texcoord = base + (3 + 2)*4
+        base_texcoord = base + (3 + 3)*4
         
         skin_base = i * skin_vertex_size
         skin_base_joints = skin_base
